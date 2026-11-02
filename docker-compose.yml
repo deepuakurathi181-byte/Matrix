@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:15.19-alpine3.24@sha256:54e0dd8e8cddcdbb9156c2486eed5a43eccb7214d7c6828097d41ce049fb3984
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-surveillance_c2}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    networks: [sensor_backplane]
+    restart: unless-stopped
+
+  inference_worker:
+    image: eoir-stack:${IMAGE_TAG:-1.4.2}
+    build: .
+    command: ["python", "inference_worker/worker.py"]
+    environment:
+      ENGINE_PATH: /app/models/eo_detector_fp16.engine
+      MANIFEST_PATH: /app/models/manifest.json
+      TRT_CACHE_DIR: /tmp/trt_cache
+      WORKER_PORT: "9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:9000/status',timeout=2)); assert d['engine_loaded'] and d['checksum_valid']"]
+      interval: 3s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+    networks: [sensor_backplane]
+    restart: unless-stopped
+
+  vision_api:
+    image: eoir-stack:${IMAGE_TAG:-1.4.2}
+    build: .
+    command: ["python", "vision_api/app.py"]
+    environment:
+      APP_PORT: "8000"
+      WORKER_URL: http://inference_worker:9000
+      DB_HOST: postgres
+    ports: ["${APP_PORT:-8000}:8000"]
+    depends_on:
+      inference_worker:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks: [edge_dmz, sensor_backplane]
+    restart: unless-stopped
+
+networks:
+  edge_dmz: {}
+  sensor_backplane:
+    internal: true
+
+volumes:
+  postgres_data: {}

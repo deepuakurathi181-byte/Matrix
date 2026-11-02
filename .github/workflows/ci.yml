@@ -1,0 +1,93 @@
+name: Site-Release-CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: site-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.11"
+      - name: Verify model against manifest
+        run: python -c "import hashlib,json,pathlib; m=json.loads(pathlib.Path('models/manifest.json').read_text()); assert hashlib.sha256(pathlib.Path('models/eo_detector_fp16.engine').read_bytes()).hexdigest()==m['sha256'], 'model checksum mismatch'"
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+  smoke:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Start stack
+        run: |
+          cp .env.example .env
+          sed -i 's/replace-with-a-long-random-password/ci-only-password-1234567890/' .env
+          docker compose up -d --build
+      - name: Verify runtime, endpoint, and corruption healthcheck
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://localhost:8000/health | grep -q '"worker_ready": true'; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://localhost:8000/health
+          curl --fail --silent http://localhost:8000/api/v1/detect
+          test "$(docker compose exec -T vision_api id -u | tr -d '\r')" = 10001
+          docker compose exec -T -u app inference_worker sh -c 'printf X >> /app/models/eo_detector_fp16.engine'
+          for attempt in $(seq 1 15); do
+            state="$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q inference_worker)")"
+            [[ "$state" == unhealthy ]] && break
+            sleep 1
+          done
+          test "$state" = unhealthy
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://localhost:8000/health)" = 503
+          docker compose up -d --force-recreate --no-deps inference_worker
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://localhost:8000/health | grep -q '"worker_ready": true'; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://localhost:8000/api/v1/detect
+      - if: always()
+        run: docker compose down -v
+  build:
+    needs: [verify, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set release tag
+        id: meta
+        run: echo "version=$(python -c 'import json; print(json.load(open("models/manifest.json"))["version"])')" >> "$GITHUB_OUTPUT"
+      - name: Build and size-gate immutable images
+        run: |
+          docker build --pull -t eoir-stack:${{ steps.meta.outputs.version }} -t ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA} .
+          test "$(docker image inspect eoir-stack:${{ steps.meta.outputs.version }} --format='{{.Size}}')" -lt 220000000
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [verify, smoke, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified immutable tags
+        run: |
+          VERSION="$(python -c 'import json; print(json.load(open("models/manifest.json"))["version"])')"
+          if docker manifest inspect "ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION" >/dev/null 2>&1; then
+            echo "Release tag $VERSION already exists; bump models/manifest.json before promoting." >&2
+            exit 1
+          fi
+          docker build --pull -t ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA} -t ghcr.io/${GITHUB_REPOSITORY,,}:${VERSION} .
+          docker push ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}
+          docker push ghcr.io/${GITHUB_REPOSITORY,,}:${VERSION}

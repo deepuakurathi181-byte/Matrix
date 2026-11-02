@@ -1,0 +1,7 @@
+.env
+release_*.tar.gz
+release_*.tar.gz.sha256
+**/__pycache__/
+**/*.py[cod]
+.venv/
+venv/
